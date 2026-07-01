@@ -23,10 +23,15 @@ type KVServer struct {
 	mu sync.Mutex
 
 	// Your definitions here.
+	values   map[string]string
+	versions map[string]rpc.Tversion
 }
 
 func MakeKVServer() *KVServer {
-	kv := &KVServer{}
+	kv := &KVServer{
+		values:   make(map[string]string),
+		versions: make(map[string]rpc.Tversion),
+	}
 	// Your code here.
 	return kv
 }
@@ -34,7 +39,21 @@ func MakeKVServer() *KVServer {
 // Get returns the value and version for args.Key, if args.Key
 // exists. Otherwise, Get returns ErrNoKey.
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
-	// Your code here.
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	key := args.Key
+
+	if value, ok := kv.values[key]; ok {
+		reply.Value = value
+		reply.Version = kv.versions[key]
+		reply.Err = rpc.OK
+
+	} else {
+		reply.Err = rpc.ErrNoKey
+	}
+
 }
 
 // Update the value for a key if args.Version matches the version of
@@ -42,7 +61,34 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 // If the key doesn't exist, Put installs the value if the
 // args.Version is 0, and returns ErrNoKey otherwise.
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
-	// Your code here.
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	key := args.Key
+	
+	// get current version of the key, if it exists
+	if currentVersion, ok := kv.versions[key]; ok {
+
+		// version matches
+		if args.Version == currentVersion {
+			kv.values[key] = args.Value
+			kv.versions[key] = args.Version + 1
+			reply.Err = rpc.OK
+
+		} else { // version doesn't match
+			reply.Err = rpc.ErrVersion
+		}
+	
+	} else if args.Version == 0 { // key doesn't exist and args.Version is 0 
+		kv.values[key] = args.Value
+		kv.versions[key] = 1
+		reply.Err = rpc.OK
+
+	} else { // key doesn't exist and args.Version is not 0
+		reply.Err = rpc.ErrNoKey
+	}
+
 }
 
 
