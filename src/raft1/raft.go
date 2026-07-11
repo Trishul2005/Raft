@@ -46,6 +46,8 @@ type Raft struct {
 	role 	    RaftRole
 	timestamp   time.Time
 
+	applyCh     chan raftapi.ApplyMsg
+
 }
 
 type LogEntry struct {
@@ -171,6 +173,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
+	// reject if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
+	if args.PrevLogIndex >= len(rf.log) || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// existing entry conflicts with a new one (same index
+    // but different terms), delete the existing entry and all that
+    // follow it
+	if args.PrevLogIndex+1 < len(rf.log) && len(args.Entries) > 0 {
+
+		for i, entry := range args.Entries {
+			if args.PrevLogIndex+1+i < len(rf.log) {
+				if rf.log[args.PrevLogIndex+1+i].Term != entry.Term {
+					rf.log = rf.log[:args.PrevLogIndex+1+i]
+					break
+				}
+			}
+		}
+
+	}
+
+	// append any new entries not already in the log
+	for i, entry := range args.Entries {
+		if args.PrevLogIndex+1+i >= len(rf.log) {
+			rf.log = append(rf.log, entry)
+		}
+	}
+
+	// update commitIndex if leaderCommit > commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+	}
+
 	return
 }
 
@@ -292,12 +329,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	index := -1
 	term := -1
 	isLeader := true
 
 	// Your code here (3B).
+	if rf.role != Leader {
+		isLeader = false
+		return index, term, isLeader
+	}
 
+	term = rf.currentTerm
+	index = len(rf.log)
+	rf.log = append(rf.log, LogEntry{Command: command, Term: term})
 
 	return index, term, isLeader
 }
@@ -405,22 +453,40 @@ func (rf *Raft) heartbeat() {
 
 		for i := range rf.peers {
 			if i != rf.me {
-				args := &AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: len(rf.log) - 1,
-					PrevLogTerm:  0,
-					Entries:      nil,
-					LeaderCommit: rf.commitIndex,
+
+				args := &AppendEntriesArgs{}
+
+				if len(rf.log) > rf.nextIndex[i] {
+					// send AppendEntries RPC with log entries
+					args = &AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: rf.nextIndex[i] - 1,
+						PrevLogTerm:  0,
+						Entries:      rf.log[rf.nextIndex[i]:],
+						LeaderCommit: rf.commitIndex,
+					}
+					args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+
+				} else {
+					// send heartbeat (AppendEntries RPC with no log entries)
+					args = &AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: len(rf.log) - 1,
+						PrevLogTerm:  0,
+						Entries:      nil,
+						LeaderCommit: rf.commitIndex,
+					}
+					args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 				}
-				if len(rf.log) > 0 {
-					args.PrevLogTerm = rf.log[len(rf.log)-1].Term
-				}
+
 				reply := &AppendEntriesReply{}
 
 				go func(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 					rf.sendAppendEntries(server, args, reply)
 				}(i, args, reply)
+
 			}
 		}
 
@@ -442,7 +508,71 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			rf.role = Follower
 			return
 		}
+
+		// if the term is not the same, ignore the reply
+		if reply.Term != rf.currentTerm {
+			return
+		}
+
+		if reply.Success {
+			// update nextIndex and matchIndex for the follower
+			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+			rf.matchIndex[server] = rf.nextIndex[server] - 1
+
+			// update commitIndex if a majority of followers have replicated the entry
+			for N := rf.commitIndex + 1; N < len(rf.log); N++ {
+				count := 1 // count self
+				for i := range rf.peers {
+					if i != rf.me && rf.matchIndex[i] >= N && rf.log[N].Term == rf.currentTerm {
+						count++
+					}
+				}
+				if count > len(rf.peers)/2 {
+					rf.commitIndex = N
+				}
+			}
+
+		} else {
+			// decrement nextIndex for the follower and retry
+			rf.nextIndex[server]--
+			if rf.nextIndex[server] < 1 {
+				rf.nextIndex[server] = 1
+			}
+		}
+
 	}
+}
+
+// applier is a goroutine that applies committed log entries to the state machine
+func (rf *Raft) applier() {
+
+	for {
+
+		// important to lock and unlock here to avoid deadlock, 
+		// since sending on applyCh can block
+		rf.mu.Lock()
+		messages := []raftapi.ApplyMsg{}
+
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			applyMsg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied,
+			}
+			messages = append(messages, applyMsg)
+		}
+		rf.mu.Unlock()
+
+		// send the ApplyMsg messages to the applyCh channel AFTER unlock
+		for _, msg := range messages {
+			rf.applyCh <- msg
+		}
+
+		time.Sleep(10 * time.Millisecond)
+
+	}
+
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -466,7 +596,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 3A initialization: state
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = make([]LogEntry, 0)
+	rf.log = make([]LogEntry, 1) // log starts with index 1, so we add a dummy entry at index 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
@@ -475,11 +605,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// note: no need to initialize nextIndex and matchIndex here, 
 	// since they are only used by leaders
 
+	// 3B initialization: applyCh
+	rf.applyCh = applyCh
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// start applier goroutine to apply committed log entries
+	go rf.applier()
 
 
 	return rf
