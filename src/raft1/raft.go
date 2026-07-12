@@ -9,12 +9,12 @@ package raft
 
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -95,6 +95,16 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
+
 }
 
 
@@ -116,6 +126,26 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		
+		// error...
+
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
+
 }
 
 // how many bytes in Raft's persisted log?
@@ -147,6 +177,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 // AppendEntries RPC handler.
@@ -159,6 +192,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.role = Follower
+		rf.persist()
 	}
 
 	// reject if term is less than currentTerm
@@ -177,6 +211,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex >= len(rf.log) || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+
+		// provide information for the leader to optimize its next AppendEntries RPC
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.XLen = len(rf.log)
+
+		if args.PrevLogIndex < len(rf.log) {
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
+
+			for i := args.PrevLogIndex; i >= 0; i-- {
+				if rf.log[i].Term != reply.XTerm {
+					reply.XIndex = i + 1
+					break
+				}
+			}
+		}
+
 		return
 	}
 
@@ -189,6 +240,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.PrevLogIndex+1+i < len(rf.log) {
 				if rf.log[args.PrevLogIndex+1+i].Term != entry.Term {
 					rf.log = rf.log[:args.PrevLogIndex+1+i]
+					rf.persist()
 					break
 				}
 			}
@@ -200,6 +252,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for i, entry := range args.Entries {
 		if args.PrevLogIndex+1+i >= len(rf.log) {
 			rf.log = append(rf.log, entry)
+			rf.persist()
 		}
 	}
 
@@ -251,6 +304,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.role = Follower
+		rf.persist()
 	}
 
 	// case 1 in fig 2
@@ -274,6 +328,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.timestamp = time.Now() // reset election timer
 			reply.VoteGranted = true
 			reply.Term = rf.currentTerm
+			rf.persist()
 			return
 		}
 	}
@@ -346,6 +401,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 	index = len(rf.log)
 	rf.log = append(rf.log, LogEntry{Command: command, Term: term})
+	rf.persist()
 
 	return index, term, isLeader
 }
@@ -363,6 +419,8 @@ func (rf *Raft) ticker() {
 			rf.currentTerm += 1
 			rf.votedFor = rf.me
 			rf.timestamp = time.Now()
+
+			rf.persist()
 
 			votes := 1 // count self vote
 
@@ -408,6 +466,7 @@ func (rf *Raft) electLeader(server int, args *RequestVoteArgs, reply *RequestVot
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.role = Follower
+			rf.persist()
 			return
 		}
 
@@ -506,6 +565,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.role = Follower
+			rf.persist()
 			return
 		}
 
@@ -533,11 +593,41 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			}
 
 		} else {
-			// decrement nextIndex for the follower and retry
-			rf.nextIndex[server]--
+
+			if reply.XTerm != -1 {
+				// find the last index of XTerm in the leader's log
+				lastIndexOfXTerm := -1
+				for i := len(rf.log) - 1; i >= 0; i-- {
+					if rf.log[i].Term == reply.XTerm {
+						lastIndexOfXTerm = i
+						break
+					}
+				}
+
+				// Case 1: leader doesn't have XTerm:
+				//     nextIndex = XIndex
+				// XTerm:  term in the conflicting entry (if any)
+				if lastIndexOfXTerm == -1 {
+					rf.nextIndex[server] = reply.XIndex
+				} else {
+					// Case 2: leader has XTerm:
+					//     nextIndex = (index of leader's last entry for XTerm) + 1
+					rf.nextIndex[server] = lastIndexOfXTerm + 1
+				}
+
+			} else {
+				// Case 3: follower's log is too short:
+				//     nextIndex = XLen
+				// XLen:   log length
+				rf.nextIndex[server] = reply.XLen
+			}
+
+
+			// ensure the nextIndex to be at least 1
 			if rf.nextIndex[server] < 1 {
 				rf.nextIndex[server] = 1
 			}
+
 		}
 
 	}
