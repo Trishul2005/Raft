@@ -37,7 +37,30 @@ func (ck *Clerk) Leader() int {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 	// You will have to modify this function.
-	return "", 0, ""
+
+	for {
+
+		var reply rpc.GetReply
+		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.Get", &rpc.GetArgs{Key: key}, &reply)
+		if !ok {
+			ck.leader = (ck.leader + 1) % len(ck.servers)
+			continue
+		}
+
+		if reply.Err == rpc.OK {
+			return reply.Value, reply.Version, rpc.OK
+
+		} else if reply.Err == rpc.ErrNoKey {
+			return "", 0, rpc.ErrNoKey
+
+		} else if reply.Err == rpc.ErrWrongLeader {
+			ck.leader = (ck.leader + 1) % len(ck.servers)
+			continue
+		}
+
+	}
+
+	return "", 0, rpc.ErrNoKey
 }
 
 // Put updates key with value only if the version in the
@@ -59,5 +82,34 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return ""
+
+	resend := false
+	for {
+
+		var reply rpc.PutReply
+		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.Put", &rpc.PutArgs{Key: key, Value: value, Version: version}, &reply)
+		if !ok {
+			ck.leader = (ck.leader + 1) % len(ck.servers)
+			resend = true
+			continue
+		}
+
+		if reply.Err == rpc.OK {
+			return rpc.OK
+
+		} else if reply.Err == rpc.ErrVersion {
+			if resend {
+				return rpc.ErrMaybe
+			}
+			return rpc.ErrVersion
+
+		} else if reply.Err == rpc.ErrWrongLeader {
+			ck.leader = (ck.leader + 1) % len(ck.servers)
+			resend = true
+			continue
+		}
+
+	}
+
+	return rpc.ErrNoKey
 }

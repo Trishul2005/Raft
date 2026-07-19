@@ -47,6 +47,7 @@ type Raft struct {
 	timestamp   time.Time
 
 	applyCh     chan raftapi.ApplyMsg
+	heartbeatCh chan struct{}
 
 	// snapshot
 	snapshotIndex int
@@ -328,7 +329,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 
 	// reject if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
-	if args.PrevLogIndex >= rf.lastLogIndex()+1 || (args.PrevLogIndex >= 0 && rf.log[rf.toArrayIdx(args.PrevLogIndex)].Term != args.PrevLogTerm) {
+	if args.PrevLogIndex >= rf.lastLogIndex()+1 || (args.PrevLogIndex >= rf.snapshotIndex && rf.log[rf.toArrayIdx(args.PrevLogIndex)].Term != args.PrevLogTerm) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 
@@ -357,7 +358,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex+1 < rf.lastLogIndex() + 1 && len(args.Entries) > 0 {
 
 		for i, entry := range args.Entries {
-			if args.PrevLogIndex+1+i < rf.lastLogIndex() + 1 {
+			if args.PrevLogIndex+1+i < rf.lastLogIndex() + 1 && args.PrevLogIndex+1+i >= rf.snapshotIndex {
 				if rf.log[rf.toArrayIdx(args.PrevLogIndex+1+i)].Term != entry.Term {
 					rf.log = rf.log[:rf.toArrayIdx(args.PrevLogIndex+1+i)]
 					rf.persist()
@@ -518,6 +519,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 	index = rf.lastLogIndex() + 1
 	rf.log = append(rf.log, LogEntry{Command: command, Term: term})
+	select {
+	case rf.heartbeatCh <- struct{}{}:
+	default:
+	}
 	rf.persist()
 
 	return index, term, isLeader
@@ -685,7 +690,10 @@ func (rf *Raft) heartbeat() {
 		}
 
 		rf.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-rf.heartbeatCh:
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
@@ -860,6 +868,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 3D initialization: snapshot recovery
 	rf.commitIndex = rf.snapshotIndex
 	rf.lastApplied = rf.snapshotIndex
+
+	rf.heartbeatCh = make(chan struct{}, 1)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
