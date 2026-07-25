@@ -259,8 +259,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
-	// replace log
-	rf.log = []LogEntry{{Term: args.LastIncludedTerm}} // create a new log with a dummy entry
+	 // replace log, preserving entries beyond the snapshot if terms match
+	arrayIdx := args.LastIncludedIndex - rf.snapshotIndex
+	if arrayIdx < len(rf.log) && rf.log[arrayIdx].Term == args.LastIncludedTerm {
+		rf.log = append([]LogEntry{{Term: args.LastIncludedTerm}}, rf.log[arrayIdx+1:]...)
+	} else {
+		rf.log = []LogEntry{{Term: args.LastIncludedTerm}}
+	}
 
 	// persist the snapshot and the updated Raft state to persistent storage
 	rf.snapshotIndex = args.LastIncludedIndex

@@ -1,12 +1,13 @@
 package kvraft
 
 import (
+	"bytes"
+
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/tester1"
-
 )
 
 type KVServer struct {
@@ -61,11 +62,32 @@ func (kv *KVServer) DoOp(req any) any {
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(kv.data)
+	return w.Bytes()
+
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+
+	if data == nil || len(data) == 0 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var kvData map[string]rpc.GetReply
+	if d.Decode(&kvData) != nil {
+		panic("Failed to decode KVServer data")
+	} else {
+		kv.data = kvData
+	}
+
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {

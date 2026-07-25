@@ -47,6 +47,8 @@ type RSM struct {
 	// Your definitions here.
 	waiting map[int][]chan notification
 	counter int
+
+	persister *tester.Persister
 }
 
 // servers[] contains the ports of the set of
@@ -74,6 +76,12 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
+		rsm.persister = persister
+	}
+
+	ReadSnapshot := persister.ReadSnapshot()
+	if ReadSnapshot != nil && len(ReadSnapshot) > 0 {
+		rsm.sm.Restore(ReadSnapshot)
 	}
 
 	go rsm.Reader()
@@ -148,6 +156,10 @@ func (rsm *RSM) Reader() {
 		if msg.CommandValid {
 			op := msg.Command.(Op)
 			result := rsm.sm.DoOp(op.Req)
+
+			if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() >= rsm.maxraftstate {
+				rsm.rf.Snapshot(msg.CommandIndex, rsm.sm.Snapshot())
+			}
 
 			rsm.mu.Lock()
 			if chans, ok := rsm.waiting[msg.CommandIndex]; ok {
