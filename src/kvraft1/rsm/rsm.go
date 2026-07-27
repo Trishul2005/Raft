@@ -45,8 +45,9 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	waiting map[int][]chan notification
-	counter int
+	waiting  map[int][]chan notification
+	counter  int
+	forceCh  chan struct{}
 
 	persister *tester.Persister
 }
@@ -73,6 +74,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
 		waiting:      make(map[int][]chan notification),
+		forceCh:      make(chan struct{}, 1),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
@@ -91,6 +93,13 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
+}
+
+func (rsm *RSM) ForceSnapshot() {
+	select {
+	case rsm.forceCh <- struct{}{}:
+	default:
+	}
 }
 
 // Submit a command to Raft, and wait for it to be committed.  It
@@ -157,8 +166,16 @@ func (rsm *RSM) Reader() {
 			op := msg.Command.(Op)
 			result := rsm.sm.DoOp(op.Req)
 
-			if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() >= rsm.maxraftstate {
-				rsm.rf.Snapshot(msg.CommandIndex, rsm.sm.Snapshot())
+			if rsm.maxraftstate != -1 {
+				forceSnap := false
+				select {
+				case <-rsm.forceCh:
+					forceSnap = true
+				default:
+				}
+				if forceSnap || rsm.rf.PersistBytes() >= rsm.maxraftstate {
+					rsm.rf.Snapshot(msg.CommandIndex, rsm.sm.Snapshot())
+				}
 			}
 
 			rsm.mu.Lock()

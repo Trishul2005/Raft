@@ -19,18 +19,32 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 
+// dupEntry records the most recent Put a client has issued, so a
+// retransmission of that same request can be answered without
+// re-executing it. Callers of Put issue requests one at a time (a
+// Clerk never has two Puts in flight simultaneously), so remembering
+// only the latest sequence number per client is enough: any incoming
+// Seq older than what's recorded here must already be resolved as far
+// as that client is concerned.
+type dupEntry struct {
+	seq   int64
+	reply rpc.PutReply
+}
+
 type KVServer struct {
 	mu sync.Mutex
 
 	// Your definitions here.
 	values   map[string]string
 	versions map[string]rpc.Tversion
+	dup      map[int64]dupEntry
 }
 
 func MakeKVServer() *KVServer {
 	kv := &KVServer{
 		values:   make(map[string]string),
 		versions: make(map[string]rpc.Tversion),
+		dup:      make(map[int64]dupEntry),
 	}
 	// Your code here.
 	return kv
@@ -65,8 +79,17 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
+	if d, ok := kv.dup[args.ClientId]; ok && args.Seq <= d.seq {
+		// Retransmission of a request we've already executed (or an
+		// even older one that no longer matters to this client):
+		// replay the recorded outcome instead of re-executing.
+		*reply = d.reply
+		return
+	}
+	defer func() { kv.dup[args.ClientId] = dupEntry{seq: args.Seq, reply: *reply} }()
+
 	key := args.Key
-	
+
 	// get current version of the key, if it exists
 	if currentVersion, ok := kv.versions[key]; ok {
 

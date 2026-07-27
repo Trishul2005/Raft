@@ -476,3 +476,101 @@ func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable4C(t *testing.T
 	tester.AnnotateTest("TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable4C", ts.nservers)
 	ts.GenericTest()
 }
+
+// rawPut sends args directly (bypassing Clerk) so the test controls
+// ClientId/Seq itself, retrying across servers/leader changes like a
+// real Clerk would until it gets a definitive reply.
+func rawPut(t *testing.T, clnt *tester.Clnt, servers []string, args *rpc.PutArgs) rpc.PutReply {
+	deadline := time.Now().Add(10 * time.Second)
+	i := 0
+	for time.Now().Before(deadline) {
+		var reply rpc.PutReply
+		ok := clnt.Call(servers[i%len(servers)], "KVServer.Put", args, &reply)
+		i++
+		if !ok || reply.Err == rpc.ErrWrongLeader {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		return reply
+	}
+	t.Fatalf("no server accepted the Put within the deadline")
+	return rpc.PutReply{}
+}
+
+// Directly exercises the replicated state machine's dup detection:
+// sending the exact same PutArgs (same ClientId/Seq) twice -- as a
+// client would after retrying because it never saw the first reply,
+// possibly against a new leader -- must apply the Put only once, with
+// both RPCs returning the identical, definitive reply.
+func TestExactlyOnce(t *testing.T) {
+	ts := MakeTest(t, "exactly-once dup detection", 1, 3, true, false, false, -1, false)
+	tester.AnnotateTest("TestExactlyOnce", ts.nservers)
+	defer ts.Cleanup()
+
+	clnt := ts.Config.MakeClient()
+	defer ts.DeleteClient(clnt)
+	servers := ts.Group(Gid).SrvNames()
+
+	args := rpc.PutArgs{Key: "k", Value: "v1", Version: 0, ClientId: 12345, Seq: 1}
+
+	r1 := rawPut(t, clnt, servers, &args)
+	if r1.Err != rpc.OK {
+		t.Fatalf("first Put err %v; expected OK", r1.Err)
+	}
+
+	// Simulate the reply having been lost: retransmit the identical
+	// request (same ClientId, same Seq).
+	r2 := rawPut(t, clnt, servers, &args)
+	if r2.Err != rpc.OK {
+		t.Fatalf("retransmitted Put err %v; expected the replayed OK", r2.Err)
+	}
+
+	ck := ts.MakeClerk()
+	if val, ver, err := ck.Get("k"); err != rpc.OK {
+		t.Fatalf("Get err %v", err)
+	} else if val != "v1" || ver != 1 {
+		t.Fatalf("Put executed more than once: got value=%q version=%d, want value=%q version=1", val, ver, "v1")
+	}
+
+	// A genuinely new request (new Seq) from the same client must not
+	// be treated as a duplicate.
+	args2 := rpc.PutArgs{Key: "k", Value: "v2", Version: 1, ClientId: 12345, Seq: 2}
+	r3 := rawPut(t, clnt, servers, &args2)
+	if r3.Err != rpc.OK {
+		t.Fatalf("second Put err %v; expected OK", r3.Err)
+	}
+	if val, ver, err := ck.Get("k"); err != rpc.OK {
+		t.Fatalf("Get err %v", err)
+	} else if val != "v2" || ver != 2 {
+		t.Fatalf("got value=%q version=%d, want value=%q version=2", val, ver, "v2")
+	}
+}
+
+// With one client and an unreliable network, exactly-once semantics
+// mean Clerk.Put never needs to fall back to the ambiguous ErrMaybe:
+// server-side dup detection, replicated via the state machine so it
+// survives leader changes, lets Put always return a single, definitive
+// answer no matter how many times the underlying RPC had to retry.
+func TestUnreliableNetExactlyOnce(t *testing.T) {
+	const NTRY = 50
+
+	ts := MakeTest(t, "exactly-once, unreliable net, one client", 1, 3, false, false, false, -1, false)
+	tester.AnnotateTest("TestUnreliableNetExactlyOnce", ts.nservers)
+	defer ts.Cleanup()
+
+	ck := ts.MakeClerk()
+
+	for try := 0; try < NTRY; try++ {
+		val := strconv.Itoa(try)
+		if err := ck.Put("k", val, rpc.Tversion(try)); err != rpc.OK {
+			t.Fatalf("Put err %v; expected OK (exactly-once semantics should never surface ErrMaybe)", err)
+		}
+		if gval, gver, err := ck.Get("k"); err != rpc.OK {
+			t.Fatalf("Get err %v", err)
+		} else if gver != rpc.Tversion(try+1) {
+			t.Fatalf("wrong version %d, expected %d", gver, try+1)
+		} else if gval != val {
+			t.Fatalf("wrong value %q, expected %q", gval, val)
+		}
+	}
+}

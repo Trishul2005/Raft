@@ -1,20 +1,36 @@
 package kvsrv
 
 import (
+	crand "crypto/rand"
+	"math/big"
+	"time"
+
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/tester1"
-	"time"
 )
 
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := crand.Int(crand.Reader, max)
+	return bigx.Int64()
+}
 
 type Clerk struct {
 	clnt   *tester.Clnt
 	server string
+
+	// id identifies this Clerk uniquely across the lifetime of the
+	// test; seq is a per-Clerk request counter. Together they let the
+	// server recognize a retransmitted Put and replay its original
+	// outcome (see server.go's dup table) instead of re-executing it
+	// or leaving the Clerk with an ambiguous ErrMaybe.
+	id  int64
+	seq int64
 }
 
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, server: server}
+	ck := &Clerk{clnt: clnt, server: server, id: nrand()}
 	// You may add code here.
 	return ck
 }
@@ -48,16 +64,16 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 }
 
-// Put updates key with value only if the version in the
-// request matches the version of the key at the server.  If the
-// versions numbers don't match, the server should return
-// ErrVersion.  If Put receives an ErrVersion on its first RPC, Put
-// should return ErrVersion, since the Put was definitely not
-// performed at the server. If the server returns ErrVersion on a
-// resend RPC, then Put must return ErrMaybe to the application, since
-// its earlier RPC might have been processed by the server successfully
-// but the response was lost, and the Clerk doesn't know if
-// the Put was performed or not.
+// Put updates key with value only if the version in the request
+// matches the version of the key at the server. If the versions
+// numbers don't match, the server returns ErrVersion.
+//
+// Every attempt of this Put -- the original send and any retries after
+// a lost request or reply -- carries the same (ClientId, Seq) pair. The
+// server's dup table (see server.go) recognizes a retry of a request
+// it already executed and replays that original reply verbatim, so
+// Put's result is always the true, definitive outcome: it never needs
+// to fall back to ErrMaybe.
 //
 // You can send an RPC with code like this:
 // ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
@@ -67,34 +83,18 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 
-	resend := false
+	ck.seq++
+	args := rpc.PutArgs{Key: key, Value: value, Version: version, ClientId: ck.id, Seq: ck.seq}
 
 	for {
-		args := rpc.PutArgs{Key: key, Value: value, Version: version}
 		reply := rpc.PutReply{}
 		ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
 		if !ok {
-			resend = true
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		if reply.Err == rpc.OK {
-			return rpc.OK
-		}
-
-		if reply.Err == rpc.ErrVersion {
-			if resend {
-				return rpc.ErrMaybe
-			} else {
-				return rpc.ErrVersion
-			}
-		}
-
-		if reply.Err == rpc.ErrNoKey {
-			return rpc.ErrNoKey
-		}
-
+		return reply.Err
 	}
 
 }
