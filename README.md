@@ -1,4 +1,4 @@
-# Distributed Key/Value Store
+# Raft - Distributed Key/Value Store
 
 A fault-tolerant, linearizable, horizontally-sharded key/value storage system built from scratch in Go, on top of a from-scratch implementation of the [Raft consensus protocol](https://raft.github.io/raft.pdf).
 
