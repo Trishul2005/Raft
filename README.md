@@ -2,7 +2,7 @@
 
 A fault-tolerant, linearizable, sharded key/value storage system built from scratch in Go, on top of a from-scratch implementation of the [Raft consensus protocol](https://raft.github.io/raft.pdf).
 
-The system spans the full stack of a modern replicated datastore: leader election and log replication, crash-recoverable persistence, log compaction via snapshotting, a reusable replicated-state-machine abstraction, exactly-once client semantics, and a sharded deployment with online reconfiguration driven by a fault-tolerant controller. A distributed MapReduce engine with worker fault tolerance is also included.
+The system spans the full stack of a modern replicated datastore: leader election and log replication, crash-recoverable persistence, log compaction via snapshotting, a reusable replicated-state-machine abstraction, exactly-once client semantics, and a sharded deployment with online reconfiguration driven by a fault-tolerant controller.
 
 Every component is validated by an automated fault-injection test suite (117 tests) that runs under the Go race detector and subjects the system to dropped and reordered messages, network partitions, server crashes and restarts, and concurrent clients — with linearizability verified by the [Porcupine](https://github.com/anishathalye/porcupine) model checker.
 
@@ -17,10 +17,8 @@ Developed against the MIT 6.5840 (Distributed Systems) lab specifications.
 - [Components](#components)
   - [1. Raft Consensus (`raft1`)](#1-raft-consensus-raft1)
   - [2. Replicated State Machine (`kvraft1/rsm`)](#2-replicated-state-machine-kvraft1rsm)
-  - [3. Single-Node KV Server and Distributed Lock (`kvsrv1`)](#3-single-node-kv-server-and-distributed-lock-kvsrv1)
-  - [4. Fault-Tolerant KV Service (`kvraft1`)](#4-fault-tolerant-kv-service-kvraft1)
-  - [5. Sharded KV Service (`shardkv1`)](#5-sharded-kv-service-shardkv1)
-  - [6. Distributed MapReduce (`mr`)](#6-distributed-mapreduce-mr)
+  - [3. Fault-Tolerant KV Service (`kvraft1`)](#3-fault-tolerant-kv-service-kvraft1)
+  - [4. Sharded KV Service (`shardkv1`)](#4-sharded-kv-service-shardkv1)
 - [Extension: Exactly-Once `Put`](#extension-exactly-once-put)
 - [Building and Testing](#building-and-testing)
 - [Testing Methodology](#testing-methodology)
@@ -82,9 +80,7 @@ src/
 │   ├── rsm/                 Reusable replicated-state-machine layer over Raft
 │   ├── server.go            Replicated KV state machine (DoOp/Snapshot/Restore)
 │   └── client.go            Leader-tracking, deduplicating Clerk
-├── kvsrv1/
-│   ├── server.go            Single-node versioned KV server
-│   ├── client.go            Retrying Clerk with request deduplication
+├── kvsrv1/                  Single-node versioned KV server (controller's config store)
 │   ├── lock/                Distributed lock built on conditional put
 │   └── rpc/                 Shared RPC types and error codes
 ├── shardkv1/
@@ -92,8 +88,7 @@ src/
 │   ├── shardcfg/            Configuration representation, Key2Shard hashing
 │   ├── shardctrler/         Controller: InitConfig, Query, ChangeConfigTo, recovery
 │   └── shardgrp/            Per-group replicated server + clerk + shard RPCs
-├── mr/                      Distributed MapReduce coordinator and worker
-├── mrapps/                  MapReduce applications (wc, indexer, crash, ...)
+├── mr/, mrapps/             Distributed MapReduce coordinator, worker, and applications
 ├── labrpc/                  Simulated lossy/reordering RPC transport
 ├── labgob/                  Gob wrapper with capitalization diagnostics
 ├── kvtest1/                 KV test harness + Porcupine linearizability checking
@@ -151,29 +146,20 @@ type StateMachine interface {
 - **Snapshot policy:** after each applied operation the layer compares `raft.PersistBytes()` against `maxraftstate` and triggers a snapshot when the log approaches the threshold; `maxraftstate == -1` disables compaction. On startup, a non-empty persisted snapshot is passed to `Restore`, and `SnapshotValid` apply messages (from `InstallSnapshot`) restore state on lagging followers.
 - **`ForceSnapshot()`** lets a state machine request an out-of-band snapshot after an operation that shrinks its footprint — used by shard groups after `DeleteShard`, so that space reclaimed by giving away a shard is actually reflected in the persisted state rather than waiting for log growth.
 
-### 3. Single-Node KV Server and Distributed Lock (`kvsrv1`)
+### 3. Fault-Tolerant KV Service (`kvraft1`)
 
-**Versioned key/value store.** Each key maps to a `(value, version)` pair. `Put(key, value, version)` is a compare-and-swap: it applies only if the supplied version matches the server's version, and then increments it; version `0` creates a new key. Mismatches return `ErrVersion`, absent keys return `ErrNoKey`. This conditional-put primitive is the foundation for every higher-level coordination protocol in the repository.
+A replicated key/value store layered on `rsm`, available as long as a majority of peers can communicate.
 
-**Reliability.** The Clerk retries indefinitely across dropped requests and dropped replies (with backoff), while the server's deduplication table makes retransmission safe (see [Extension](#extension-exactly-once-put)).
-
-**Distributed lock (`kvsrv1/lock`).** `Acquire`/`Release` are implemented purely in terms of `Get` and conditional `Put`, with no server-side lock support:
-- Each lock client holds a random identity; the lock key stores the current holder's id, or the empty string when free.
-- Acquisition is a CAS from "free" to "held by me" at the observed version — mutual exclusion follows directly from the version check, since only one of several racing writers can match a given version.
-- Reads are re-checked on each iteration so a client that already holds the lock (for example, after a retransmitted acquisition it never saw acknowledged) recognizes its own id and returns rather than deadlocking against itself.
-- Release is likewise a CAS, and is a no-op when the caller is not the holder, so a stale release can never revoke someone else's lock.
-- Multiple independent named locks are supported over a single clerk.
-
-### 4. Fault-Tolerant KV Service (`kvraft1`)
-
-The versioned KV store layered on `rsm`, giving a replicated service that remains available as long as a majority of peers can communicate.
+**Versioned CAS semantics.** Each key maps to a `(value, version)` pair. `Put(key, value, version)` applies only if the supplied version matches the server's current version, then increments it; version `0` creates a new key. Mismatches return `ErrVersion`, absent keys `ErrNoKey`. This conditional put is the only write primitive in the system, and every higher-level coordination protocol is built from it — including the controller's single-writer election during reconfiguration, and the distributed lock in `kvsrv1/lock`, which achieves mutual exclusion purely by CAS-ing a lock key from "free" to "held by me" at an observed version.
 
 - **`DoOp`** implements `Get` and the conditional `Put` against the in-memory map, plus the per-client deduplication table.
 - **Reads go through the log.** `Get` is submitted through Raft rather than served from local state, which prevents a deposed or partitioned leader from returning stale data and is what makes the history linearizable rather than merely sequentially consistent.
 - **`Snapshot`/`Restore`** serialize both the key/value map and the deduplication table, so exactly-once semantics survive log compaction, crashes, and `InstallSnapshot` on a lagging follower.
 - **Clerk** caches the last known leader and round-robins on `ErrWrongLeader` or transport failure, avoiding a full leader search on every request; retries carry an unchanged `(ClientId, Seq)` pair so a leader change is transparent to the caller.
 
-### 5. Sharded KV Service (`shardkv1`)
+`kvsrv1` is the unreplicated single-node variant of this same state machine and RPC interface. It is not a toy: the shard controller stores its configuration there, so its versioned `Put` is what makes concurrent reconfiguration safe.
+
+### 4. Sharded KV Service (`shardkv1`)
 
 Keys are partitioned across 12 shards (`Key2Shard` = FNV-1a hash modulo `NShards`), and each shard is owned by exactly one replicated shard group at any moment. Throughput scales with the number of groups, and groups can join or leave the cluster while the service stays online.
 
@@ -198,16 +184,6 @@ Keys are partitioned across 12 shards (`Key2Shard` = FNV-1a hash modulo `NShards
 - On `ErrWrongGroup`, evicts the stale group clerk, re-queries the configuration, and retries against the new owner.
 - Per-group calls are bounded by a short deadline (500 ms for `Get`/`Put`, chosen to outlast a normal election yet re-check the configuration frequently; 4 s for controller-issued migration RPCs, which have no outer retry loop). A group that has been removed from the cluster therefore never blocks a client indefinitely.
 - **Ambiguity resolution:** if a group's clerk reports `ErrMaybe` (a request sent with no reply received), the Clerk resolves it rather than propagating it. Because `Put` is a CAS, reading the key back is diagnostic: a version still at or below the attempted one proves the write did not land (safe to retry with the same version); a version exactly one higher identifies the winner by comparing the value. Only if the version has advanced further is the outcome reported as genuinely ambiguous.
-
-### 6. Distributed MapReduce (`mr`)
-
-A coordinator/worker MapReduce engine communicating over Unix-domain-socket RPC, with applications loaded at runtime as Go plugins.
-
-- **Phased scheduling.** The coordinator advances through map → reduce → completed, handing out map tasks until all complete, then reduce tasks, then exit tasks; workers that arrive with nothing to do are told to wait rather than spin.
-- **Worker fault tolerance.** A background reaper re-marks any task still in progress after 10 seconds as idle, so it is reassigned to a healthy worker. Crashed, hung, and merely slow workers are handled by the same mechanism.
-- **Atomic output.** Both map and reduce outputs are written to temporary files and moved into place with `os.Rename`, so a worker that dies mid-write can never expose a partially written intermediate or output file — and a duplicate execution of a re-issued task simply overwrites the result atomically.
-- **Partitioning.** Map output is bucketed into `nReduce` intermediate files by `ihash(key) % nReduce`, JSON-encoded for the reduce phase, which sorts by key and emits one `mr-out-X` per reduce task.
-- **Clean shutdown.** Workers exit on an explicit exit task or when the coordinator becomes unreachable.
 
 ---
 
@@ -236,13 +212,14 @@ Requires Go 1.22 or later. All commands are run from `src/`.
 ```bash
 cd src
 
-make mr          # distributed MapReduce
-make kvsrv1      # single-node key/value server
-make lock1       # distributed lock
 make raft1       # Raft consensus (3A-3D)
 make rsm1        # replicated state machine layer (4A, 4C)
 make kvraft1     # fault-tolerant key/value service (4B, 4C)
 make shardkv     # sharded key/value service (5A-5C)
+
+make kvsrv1      # single-node key/value server
+make lock1       # distributed lock
+make mr          # distributed MapReduce
 ```
 
 Run a subset of tests with `RUN`:
@@ -255,7 +232,7 @@ make RUN="-run TestJoinLeaveBasic5A" shardkv
 
 All targets build and run with `-race` and `-v` by default. Because the suites deliberately exercise timeouts, partitions, and elections, several take minutes of wall-clock time; the shardkv target uses a 15-minute limit.
 
-Standalone daemons for manual experimentation are built into `main/` (`raft1d`, `rsm1d`, `kvsrv1d`, `kvraft1d`, `shardgrp1d`, `mrcoordinator`, `mrworker`).
+Standalone daemons for manual experimentation are built into `main/` (`raft1d`, `rsm1d`, `kvsrv1d`, `kvraft1d`, `shardgrp1d`).
 
 ---
 
