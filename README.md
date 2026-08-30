@@ -1,6 +1,6 @@
 # Raft - Distributed Key/Value Store
 
-A fault-tolerant, linearizable, horizontally-sharded key/value storage system built from scratch in Go, on top of a from-scratch implementation of the [Raft consensus protocol](https://raft.github.io/raft.pdf).
+A fault-tolerant, linearizable, sharded key/value storage system built from scratch in Go, on top of a from-scratch implementation of the [Raft consensus protocol](https://raft.github.io/raft.pdf).
 
 The system spans the full stack of a modern replicated datastore: leader election and log replication, crash-recoverable persistence, log compaction via snapshotting, a reusable replicated-state-machine abstraction, exactly-once client semantics, and a sharded deployment with online reconfiguration driven by a fault-tolerant controller. A distributed MapReduce engine with worker fault tolerance is also included.
 
